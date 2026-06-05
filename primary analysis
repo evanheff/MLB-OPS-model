@@ -1,0 +1,178 @@
+---
+title: "What Actually Predicts a Hitter's Next Season?"
+author: "Evan Heffelfinger"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: show
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: '2'
+subtitle: "A Statcast-era OPS projection, built one regression at a time"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 8, fig.height = 4.6, dpi = 130, out.width = "100%")
+```
+
+```{r packages}
+pkgs <- c("Lahman", "dplyr", "tidyr", "tibble", "purrr", "readr", "httr",
+          "ggplot2", "broom", "scales")
+new <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new)) install.packages(new)
+invisible(lapply(c(pkgs, "baseballr"), library, character.only = TRUE))
+
+set.seed(1)
+dir.create("cache", showWarnings = FALSE)
+
+TARGET_START   <- 2016   # Statcast-era target seasons
+STATCAST_START <- 2015
+TRAIN_END      <- 2022   # train on targets <= this; validate on later years
+MIN_PA_TARGET  <- 250; MIN_PA_LAG1 <- 100
+col_a <- "#2C7FB8"; col_b <- "#800000"; col_grey <- "#BDBDBD"
+theme_set(theme_minimal(base_size = 12) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(face = "bold")))
+```
+
+## The data
+
+Each row is one player-season we want to project (qualified hitters, 2016
+onward). The features come **only** from earlier seasons: a Marcel-style blend of
+the prior three years' OPS (recency- and playing-time-weighted, regressed toward
+league average and age-adjusted), prior-year plate discipline and batted-ball
+luck, age, home-park factor, and joined in from Baseball Savant via the
+Chadwick id crosswalk, the prior year's **expected wOBA (xwOBA)**.
+
+```{r lahman}
+bat_ps <- Batting |>
+  filter(yearID >= 2012, yearID != 2020) |>
+  group_by(playerID, yearID) |>
+  summarise(across(c(AB, H, X2B, X3B, HR, BB, SO, HBP, SH, SF),
+                   ~ sum(.x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(PA = AB + BB + HBP + SF, TB = H + X2B + 2*X3B + 3*HR,
+         OBP = ifelse((AB+BB+HBP+SF) > 0, (H+BB+HBP)/(AB+BB+HBP+SF), NA_real_),
+         SLG = ifelse(AB > 0, TB/AB, NA_real_), OPS = OBP + SLG,
+         Kpct = ifelse(PA > 0, SO/PA, NA_real_),
+         BABIP = ifelse((AB-SO-HR+SF) > 0, (H-HR)/(AB-SO-HR+SF), NA_real_))
+
+league_year <- bat_ps |> group_by(yearID) |>
+  summarise(H=sum(H), AB=sum(AB), BB=sum(BB), HBP=sum(HBP), SF=sum(SF),
+            X2B=sum(X2B), X3B=sum(X3B), HR=sum(HR), .groups="drop") |>
+  mutate(lg_ops = (H+BB+HBP)/(AB+BB+HBP+SF) + (H+X2B+2*X3B+3*HR)/AB) |>
+  select(yearID, lg_ops)
+lg_ops_overall <- mean(league_year$lg_ops)
+
+people_df <- tryCatch(get("People"), error = function(e) get("Master"))
+bio <- people_df |>
+  transmute(playerID, bbrefID, birthYear, birthMonth, bats,
+            nameFirst, nameLast)
+debut_year <- Batting |> group_by(playerID) |>
+  summarise(first_year = min(yearID), .groups = "drop")
+park_year <- Batting |>
+  filter(yearID >= 2012, yearID != 2020) |>
+  group_by(playerID, yearID, teamID) |> summarise(AB=sum(AB), .groups="drop") |>
+  group_by(playerID, yearID) |> slice_max(AB, n=1, with_ties=FALSE) |> ungroup() |>
+  left_join(select(Teams, yearID, teamID, BPF), by=c("yearID","teamID")) |>
+  transmute(playerID, yearID, park_bpf = as.numeric(BPF))
+
+# Lagged + Marcel blend
+lag1 <- bat_ps |> transmute(playerID, yearID = yearID + 1,
+  lag1_OPS = OPS, lag1_SLG = SLG, lag1_Kpct = Kpct, lag1_BABIP = BABIP, lag1_PA = PA)
+lag2 <- bat_ps |> transmute(playerID, yearID = yearID + 2, lag2_OPS = OPS, lag2_PA = PA)
+lag3 <- bat_ps |> transmute(playerID, yearID = yearID + 3, lag3_OPS = OPS, lag3_PA = PA)
+
+model_df <- bat_ps |> transmute(playerID, yearID, ops_target = OPS, pa_target = PA) |>
+  left_join(lag1, by=c("playerID","yearID")) |>
+  left_join(lag2, by=c("playerID","yearID")) |>
+  left_join(lag3, by=c("playerID","yearID")) |>
+  left_join(bio, by="playerID") |>
+  left_join(debut_year, by="playerID") |>
+  left_join(mutate(park_year, yearID = yearID + 1), by=c("playerID","yearID")) |>
+  left_join(transmute(league_year, yearID = yearID + 1, lag1_lg_ops = lg_ops), by="yearID") |>
+  mutate(age = yearID - birthYear - ifelse(!is.na(birthMonth) & birthMonth > 6, 1, 0),
+         age_sq = age^2)
+
+w1<-5; w2<-4; w3<-3; REG<-300
+model_df <- model_df |>
+  mutate(o1=coalesce(lag1_OPS,0), p1=coalesce(lag1_PA,0),
+         o2=coalesce(lag2_OPS,0), p2=coalesce(lag2_PA,0),
+         o3=coalesce(lag3_OPS,0), p3=coalesce(lag3_PA,0),
+         num=w1*p1*o1+w2*p2*o2+w3*p3*o3, den=w1*p1+w2*p2+w3*p3,
+         lgb=coalesce(lag1_lg_ops, lg_ops_overall),
+         af = ifelse(age<29, 1+(29-age)*0.006, 1+(29-age)*0.003),
+         marcel_ops = ((num + lgb*REG)/(den + REG))*af) |>
+  select(-o1,-o2,-o3,-p1,-p2,-p3,-num,-den,-lgb,-af) |>
+  filter(yearID >= TARGET_START, !is.na(lag1_OPS),
+         lag1_PA >= MIN_PA_LAG1, pa_target >= MIN_PA_TARGET,
+         !is.na(park_bpf), bats %in% c("L","R","B"),
+         !is.na(age), !is.na(lag1_Kpct), !is.na(lag1_BABIP))
+```
+
+```{r statcast}
+# --- Pull prior-season xwOBA from Baseball Savant (cached after first run) ---
+cache_get <- function(key, expr) {
+  f <- file.path("cache", paste0(key, ".rds"))
+  if (file.exists(f)) return(readRDS(f)); val <- force(expr); saveRDS(val, f); val
+}
+get_savant_csv <- function(url) {
+  r <- httr::GET(url, httr::user_agent("Mozilla/5.0")); httr::stop_for_status(r)
+  readr::read_csv(httr::content(r, as="text", encoding="UTF-8"), show_col_types = FALSE)
+}
+fetch_xwoba <- function(y) cache_get(sprintf("xstats_%d", y), {
+  u <- sprintf(paste0("https://baseballsavant.mlb.com/leaderboard/expected_",
+                      "statistics?type=batter&year=%d&min=50&csv=true"), y)
+  ex <- get_savant_csv(u)
+  tibble(key_mlbam = as.integer(ex$player_id), yearID = y,
+         sc_xwoba = ex$est_woba, sc_xslg = ex$est_slg, sc_woba = ex$woba)
+})
+
+chad <- cache_get("chadwick", baseballr::chadwick_player_lu())
+pid2mlbam <- bio |> filter(!is.na(bbrefID), bbrefID != "") |>
+  distinct(playerID, bbrefID) |>
+  inner_join(chad |> filter(!is.na(key_mlbam), !is.na(key_bbref), key_bbref != "") |>
+               transmute(bbrefID = key_bbref, key_mlbam = as.integer(key_mlbam)),
+             by = "bbrefID") |> distinct(playerID, key_mlbam)
+
+statcast <- purrr::map_dfr(STATCAST_START:max(model_df$yearID), fetch_xwoba) |>
+  inner_join(pid2mlbam, by = "key_mlbam")
+sc_lag1 <- statcast |> transmute(playerID, yearID = yearID + 1,
+  lag1_sc_xwoba = sc_xwoba, lag1_sc_xslg = sc_xslg, lag1_sc_woba = sc_woba)
+
+dat <- model_df |>
+  left_join(sc_lag1, by = c("playerID", "yearID")) |>
+  filter(!is.na(lag1_sc_xwoba)) |>          # keep rows matched to Statcast
+  mutate(bats = factor(bats))
+
+cat(sprintf("Player-seasons used: %d  |  matched to Statcast: %.0f%%  |  years: %s\n",
+            nrow(dat), 100 * nrow(dat) / nrow(model_df),
+            paste(range(dat$yearID), collapse = "-")))
+```
+
+## The puzzle: which prior-season number sees the future best?
+
+```{r hook}
+cwt <- function(x) cor(x, dat$ops_target, use = "complete.obs")
+cor_df <- tibble(
+  metric = c("Last yr OPS (actual)", "Last yr SLG (actual)",
+             "Last yr wOBA (actual)", "Last yr xwOBA (expected)",
+             "Last yr xSLG (expected)"),
+  r = c(cwt(dat$lag1_OPS), cwt(dat$lag1_SLG), cwt(dat$lag1_sc_woba),
+        cwt(dat$lag1_sc_xwoba), cwt(dat$lag1_sc_xslg)),
+  kind = c("actual","actual","actual","expected","expected"))
+
+ggplot(cor_df, aes(r, reorder(metric, r), fill = kind)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.3f", r)), hjust = -0.1, size = 3.4) +
+  scale_fill_manual(values = c(actual = col_grey, expected = col_a), name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Best single leading indicator of next-season OPS",
+       subtitle = "Correlation with next year's OPS (2016+). Blue = Statcast expected stats.",
+       x = "Correlation with next-season OPS", y = NULL)
+```
