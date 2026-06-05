@@ -1,0 +1,806 @@
+---
+title: "Projecting MLB Hitters' Next-Season OPS"
+subtitle: "An interpretable forecasting pipeline"
+author: "Evan Heffelfinger"
+date: "`r format(Sys.Date(), '%B %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = FALSE, warning = FALSE,
+  fig.width = 8, fig.height = 5, dpi = 130, out.width = "100%"
+)
+```
+
+```{r packages}
+pkgs <- c("Lahman", "dplyr", "tidyr", "tibble", "ggplot2",
+          "glmnet", "xgboost", "broom", "scales")
+new <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new)) install.packages(new)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+set.seed(42)
+
+# Tunable knobs
+DATA_START    <- 1994   # earliest season to read (need 3 yrs before first target)
+TARGET_START  <- 1998   # earliest season we try to project
+TRAIN_END     <- 2015   # train on targets <= this year; test on the rest
+MIN_PA_TARGET <- 250    # a projected season must have enough PA to be meaningful
+MIN_PA_LAG1   <- 100    # require some prior-year signal to make a projection
+
+col_model <- "#2C7FB8"; col_base <- "#BDBDBD"; col_accent <- "#800000"
+theme_set(theme_minimal(base_size = 12) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(face = "bold")))
+```
+
+## Building the player-season table
+
+Players traded mid-year appear as multiple "stints," so we sum them into one
+row per player-season. The 60-game 2020 COVID season is dropped everywhere — its
+rates and playing-time totals aren't comparable to full seasons.
+
+```{r batting}
+bat_ps <- Batting |>
+  filter(yearID >= DATA_START, yearID != 2020) |>
+  group_by(playerID, yearID) |>
+  summarise(across(c(G, AB, R, H, X2B, X3B, HR, RBI, BB, SO, HBP, SH, SF),
+                   ~ sum(.x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(
+    PA    = AB + BB + HBP + SF,
+    TB    = H + X2B + 2 * X3B + 3 * HR,
+    AVG   = ifelse(AB > 0, H / AB, NA_real_),
+    OBP   = ifelse((AB + BB + HBP + SF) > 0,
+                   (H + BB + HBP) / (AB + BB + HBP + SF), NA_real_),
+    SLG   = ifelse(AB > 0, TB / AB, NA_real_),
+    OPS   = OBP + SLG,
+    BBpct = ifelse(PA > 0, BB / PA, NA_real_),
+    Kpct  = ifelse(PA > 0, SO / PA, NA_real_),
+    BABIP = ifelse((AB - SO - HR + SF) > 0,
+                   (H - HR) / (AB - SO - HR + SF), NA_real_)
+  )
+# League-average OPS per season (the run environment).
+league_year <- bat_ps |>
+  group_by(yearID) |>
+  summarise(H = sum(H), AB = sum(AB), BB = sum(BB), HBP = sum(HBP),
+            SF = sum(SF), X2B = sum(X2B), X3B = sum(X3B), HR = sum(HR),
+            .groups = "drop") |>
+  mutate(lgOBP = (H + BB + HBP) / (AB + BB + HBP + SF),
+         lgSLG = (H + X2B + 2 * X3B + 3 * HR) / AB,
+         lg_ops = lgOBP + lgSLG) |>
+  select(yearID, lg_ops)
+lg_ops_overall <- mean(league_year$lg_ops)
+```
+
+## Bio, position, and park factor
+
+Height, weight, handedness, and birth date come from the `People` table; primary
+position from `Appearances` (which includes DH); and a home-park adjustment from
+the batting park factor (`BPF`, where 100 is neutral) of whichever team the
+player logged the most at-bats with.
+
+```{r context}
+people_df <- tryCatch(get("People"), error = function(e) get("Master"))
+
+bio <- people_df |>
+  transmute(playerID, birthYear, birthMonth,
+            height = as.numeric(height), weight = as.numeric(weight),
+            bats, nameFirst, nameLast)
+
+debut_year <- Batting |>                       # from full record, not the window
+  group_by(playerID) |>
+  summarise(first_year = min(yearID), .groups = "drop")
+
+park_year <- Batting |>
+  filter(yearID >= DATA_START, yearID != 2020) |>
+  group_by(playerID, yearID, teamID) |>
+  summarise(AB = sum(AB), .groups = "drop") |>
+  group_by(playerID, yearID) |>
+  slice_max(AB, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  left_join(select(Teams, yearID, teamID, BPF), by = c("yearID", "teamID")) |>
+  transmute(playerID, yearID, park_bpf = as.numeric(BPF))
+
+pos_year <- Appearances |>
+  filter(yearID >= DATA_START, yearID != 2020) |>
+  group_by(playerID, yearID) |>
+  summarise(across(c(G_c, G_1b, G_2b, G_3b, G_ss, G_lf, G_cf, G_rf, G_dh),
+                   ~ sum(.x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(OF = G_lf + G_cf + G_rf) |>
+  transmute(playerID, yearID, C = G_c, `1B` = G_1b, `2B` = G_2b,
+            `3B` = G_3b, SS = G_ss, OF = OF, DH = G_dh) |>
+  pivot_longer(-c(playerID, yearID), names_to = "primary_pos", values_to = "G") |>
+  filter(G > 0) |>
+  group_by(playerID, yearID) |>
+  slice_max(G, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(playerID, yearID, primary_pos)
+```
+
+## Assembling lags, the Marcel blend, and the target
+
+The lagged frames are shifted forward so a player's *T−1/T−2/T−3* stats line up
+with the season we're projecting. `marcel_ops` is a recency- and playing-time-
+weighted blend of the last three seasons, regressed toward league average with a
+simple age adjustment — it serves as both a strong **baseline** and a model
+**feature**.
+
+```{r assemble}
+lag1 <- bat_ps |>
+  transmute(playerID, yearID = yearID + 1,
+            lag1_OBP = OBP, lag1_SLG = SLG, lag1_AVG = AVG, lag1_OPS = OPS,
+            lag1_BBpct = BBpct, lag1_Kpct = Kpct, lag1_BABIP = BABIP, lag1_PA = PA)
+lag2 <- bat_ps |> transmute(playerID, yearID = yearID + 2, lag2_OPS = OPS, lag2_PA = PA)
+lag3 <- bat_ps |> transmute(playerID, yearID = yearID + 3, lag3_OPS = OPS, lag3_PA = PA)
+target <- bat_ps |> transmute(playerID, yearID, ops_target = OPS, pa_target = PA)
+
+model_df <- target |>
+  left_join(lag1, by = c("playerID", "yearID")) |>
+  left_join(lag2, by = c("playerID", "yearID")) |>
+  left_join(lag3, by = c("playerID", "yearID")) |>
+  left_join(bio, by = "playerID") |>
+  left_join(debut_year, by = "playerID") |>
+  left_join(mutate(pos_year,  yearID = yearID + 1), by = c("playerID", "yearID")) |>
+  left_join(mutate(park_year, yearID = yearID + 1), by = c("playerID", "yearID")) |>
+  left_join(transmute(league_year, yearID = yearID + 1, lag1_lg_ops = lg_ops),
+            by = "yearID") |>
+  mutate(age = yearID - birthYear - ifelse(!is.na(birthMonth) & birthMonth > 6, 1, 0),
+         experience = yearID - first_year,
+         age_sq = age^2)
+
+w1 <- 5; w2 <- 4; w3 <- 3; REG <- 300
+model_df <- model_df |>
+  mutate(
+    o1 = coalesce(lag1_OPS, 0), p1 = coalesce(lag1_PA, 0),
+    o2 = coalesce(lag2_OPS, 0), p2 = coalesce(lag2_PA, 0),
+    o3 = coalesce(lag3_OPS, 0), p3 = coalesce(lag3_PA, 0),
+    num = w1 * p1 * o1 + w2 * p2 * o2 + w3 * p3 * o3,
+    den = w1 * p1 + w2 * p2 + w3 * p3,
+    lgb = coalesce(lag1_lg_ops, lg_ops_overall),
+    marcel_raw = (num + lgb * REG) / (den + REG),
+    age_factor = ifelse(age < 29, 1 + (29 - age) * 0.006, 1 + (29 - age) * 0.003),
+    marcel_ops = marcel_raw * age_factor
+  ) |>
+  select(-o1, -o2, -o3, -p1, -p2, -p3, -num, -den, -lgb, -marcel_raw, -age_factor)
+```
+
+## A clean, modern, qualified sample
+
+`lag1_OPS` is deliberately **excluded** from the model features (it equals
+`lag1_OBP + lag1_SLG`, so it would be perfectly collinear) — but it still powers
+the persistence baseline.
+
+```{r sample}
+num_feats <- c("lag1_OBP", "lag1_SLG", "lag1_AVG", "lag1_BBpct", "lag1_Kpct",
+               "lag1_BABIP", "lag1_PA", "marcel_ops", "age", "age_sq",
+               "experience", "height", "weight", "park_bpf")
+fac_feats <- c("bats", "primary_pos")
+
+model_df <- model_df |>
+  filter(yearID >= TARGET_START,
+         !is.na(lag1_OBP), lag1_PA >= MIN_PA_LAG1, pa_target >= MIN_PA_TARGET,
+         !is.na(primary_pos), !is.na(park_bpf), bats %in% c("L", "R", "B"),
+         !is.na(height), !is.na(weight), !is.na(age), !is.na(experience)) |>
+  filter(if_all(all_of(num_feats), ~ !is.na(.))) |>
+  mutate(bats = factor(bats), primary_pos = factor(primary_pos))
+
+sprintf("Modeling rows: %d  |  players: %d  |  target years: %d-%d",
+        nrow(model_df), n_distinct(model_df$playerID),
+        min(model_df$yearID), max(model_df$yearID))
+```
+
+## Design matrix, temporal split, standardization
+
+The split is **by season, not random** — we train on targets through `r 2015`
+and test on later years, so the future never leaks into the past. Continuous
+features are standardized using *training* statistics applied to the test set,
+which makes the linear coefficients comparable in magnitude; the tree model uses
+the raw matrix.
+
+```{r split}
+form  <- as.formula(paste("~", paste(c(num_feats, fac_feats), collapse = " + ")))
+X_all <- model.matrix(form, data = model_df)[, -1, drop = FALSE]
+y_all <- model_df$ops_target
+
+train_idx <- which(model_df$yearID <= TRAIN_END)
+test_idx  <- which(model_df$yearID >  TRAIN_END)
+train_df  <- model_df[train_idx, ]; test_df <- model_df[test_idx, ]
+
+X_tr_raw <- X_all[train_idx, , drop = FALSE]; X_te_raw <- X_all[test_idx, , drop = FALSE]
+y_tr <- y_all[train_idx]; y_te <- y_all[test_idx]
+
+scale_cols <- which(colnames(X_all) %in% num_feats)
+mu  <- colMeans(X_tr_raw[, scale_cols, drop = FALSE])
+sdv <- apply(X_tr_raw[, scale_cols, drop = FALSE], 2, sd); sdv[sdv == 0] <- 1
+X_tr_std <- X_tr_raw; X_te_std <- X_te_raw
+X_tr_std[, scale_cols] <- scale(X_tr_raw[, scale_cols], center = mu, scale = sdv)
+X_te_std[, scale_cols] <- scale(X_te_raw[, scale_cols], center = mu, scale = sdv)
+```
+
+## Baselines and models
+
+```{r models}
+metrics <- function(actual, pred) {
+  e <- actual - pred
+  tibble(RMSE = sqrt(mean(e^2)), MAE = mean(abs(e)),
+         R2 = 1 - sum(e^2) / sum((actual - mean(actual))^2))
+}
+
+# Baselines
+pred_base_mean <- coalesce(test_df$lag1_lg_ops, lg_ops_overall)
+pred_persist   <- test_df$lag1_OPS
+pred_marcel    <- test_df$marcel_ops
+
+# Linear regression (standardized -> comparable coefficients)
+lm_tr <- as.data.frame(X_tr_std); lm_tr$y <- y_tr
+lm_fit  <- lm(y ~ ., data = lm_tr)
+pred_lm <- predict(lm_fit, newdata = as.data.frame(X_te_std))
+
+# Elastic net
+cv_gn   <- cv.glmnet(X_tr_std, y_tr, alpha = 0.5, nfolds = 10)
+pred_gn <- as.numeric(predict(cv_gn, newx = X_te_std, s = "lambda.min"))
+
+# Gradient-boosted trees (raw features)
+dtr <- xgb.DMatrix(X_tr_raw, label = y_tr)
+dte <- xgb.DMatrix(X_te_raw, label = y_te)
+params <- list(objective = "reg:squarederror", eta = 0.05, max_depth = 4,
+               subsample = 0.8, colsample_bytree = 0.8)
+cv <- xgb.cv(params, dtr, nrounds = 1500, nfold = 5,
+             early_stopping_rounds = 40, verbose = 0)
+best_n <- ifelse(!is.null(cv$best_iteration), cv$best_iteration,
+                 which.min(cv$evaluation_log$test_rmse_mean))
+xgb_fit  <- xgb.train(params, dtr, nrounds = best_n)
+pred_xgb <- predict(xgb_fit, dte)
+```
+
+## Results: do the models beat the baselines?
+
+```{r results}
+results <- bind_rows(
+  metrics(y_te, pred_base_mean) |> mutate(model = "Baseline: prior-yr league avg"),
+  metrics(y_te, pred_persist)   |> mutate(model = "Baseline: persistence"),
+  metrics(y_te, pred_marcel)    |> mutate(model = "Baseline: Marcel"),
+  metrics(y_te, pred_lm)        |> mutate(model = "Linear regression"),
+  metrics(y_te, pred_gn)        |> mutate(model = "Elastic net"),
+  metrics(y_te, pred_xgb)       |> mutate(model = "XGBoost")
+) |>
+  mutate(is_model = !grepl("Baseline", model)) |>
+  select(model, RMSE, MAE, R2, is_model) |>
+  arrange(RMSE)
+
+gm <- function(m, col) results[[col]][results$model == m]
+results |> select(model, RMSE, MAE, R2)
+```
+
+```{r results-plot, fig.height=4.5}
+ggplot(results, aes(x = reorder(model, -RMSE), y = RMSE, fill = is_model)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = sprintf("%.4f", RMSE)), hjust = -0.1, size = 3.5) +
+  scale_fill_manual(values = c(`FALSE` = col_base, `TRUE` = col_model), guide = "none") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(title = "Test-set accuracy vs. baselines",
+       subtitle = "Lower RMSE is better (OPS units). Grey = naive baselines.",
+       x = NULL, y = "RMSE")
+```
+
+**Reading the numbers.** The best model (XGBoost) lands at an RMSE of
+`r sprintf("%.4f", gm("XGBoost","RMSE"))` and R² of
+`r sprintf("%.3f", gm("XGBoost","R2"))`, against
+`r sprintf("%.4f", gm("Baseline: Marcel","RMSE"))` / `r sprintf("%.3f", gm("Baseline: Marcel","R2"))`
+for Marcel — roughly an
+`r sprintf("%.0f%%", 100 * (gm("Baseline: Marcel","RMSE") - gm("XGBoost","RMSE")) / gm("Baseline: Marcel","RMSE"))`
+cut in error. An R² near 0.3 is in the range public projection systems achieve
+for this population; next-season OPS is genuinely hard to pin down because of
+injury, role changes, and batted-ball luck. Two honest caveats: the models
+*contain* `marcel_ops` plus extra signal, so out-performing Marcel is partly by
+construction; and the persistence baseline — predicting last year's OPS
+unchanged — is the **worst** of all, with a negative R²
+(`r sprintf("%.3f", gm("Baseline: persistence","R2"))`). That last point is the
+regression-to-the-mean story made concrete: a raw prior-year number over-trusts
+last season's noise, and the model's edge comes largely from pulling extremes
+back toward the middle.
+
+## What the models learned
+
+### Linear coefficients (standardized)
+
+```{r coef-lm}
+coef_lm <- broom::tidy(lm_fit) |>
+  filter(term != "(Intercept)") |>
+  mutate(lo = estimate - 1.96 * std.error, hi = estimate + 1.96 * std.error)
+
+ggplot(coef_lm, aes(x = estimate, y = reorder(term, estimate))) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_segment(aes(x = lo, xend = hi, yend = reorder(term, estimate)), colour = "grey50") +
+  geom_point(colour = col_model, size = 2) +
+  labs(title = "Linear model: standardized coefficients",
+       subtitle = "Effect on projected OPS of a 1-SD increase (95% CI)",
+       x = "Coefficient (OPS units per SD)", y = NULL)
+```
+
+### Elastic-net retained features
+
+```{r coef-gn}
+coef_gn <- as.matrix(coef(cv_gn, s = "lambda.min"))
+coef_gn <- tibble(term = rownames(coef_gn), estimate = coef_gn[, 1]) |>
+  filter(term != "(Intercept)", estimate != 0)
+
+ggplot(coef_gn, aes(x = estimate, y = reorder(term, estimate))) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_col(fill = col_model, width = 0.7) +
+  labs(title = "Elastic net: retained coefficients",
+       subtitle = "Features shrunk to exactly zero are dropped",
+       x = "Coefficient (per SD)", y = NULL)
+```
+
+### XGBoost variable importance
+
+```{r imp}
+imp <- xgb.importance(model = xgb_fit, feature_names = colnames(X_tr_raw))
+ggplot(head(imp, 15), aes(x = Gain, y = reorder(Feature, Gain))) +
+  geom_col(fill = col_model, width = 0.7) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "XGBoost: variable importance (gain)",
+       subtitle = "Share of predictive improvement per feature", x = "Gain", y = NULL)
+```
+
+### The aging curve the model learned
+
+Holding everyone else fixed and sweeping age across a grid (partial dependence)
+traces out the aging curve the model inferred on its own — a good sanity check
+that it learned baseball rather than noise.
+
+```{r aging, fig.height=4.8}
+pdp_sample <- X_tr_raw[sample(nrow(X_tr_raw), min(2000, nrow(X_tr_raw))), , drop = FALSE]
+age_grid <- 21:40
+pdp_age <- sapply(age_grid, function(a) {
+  Xtmp <- pdp_sample; Xtmp[, "age"] <- a
+  if ("age_sq" %in% colnames(Xtmp)) Xtmp[, "age_sq"] <- a^2
+  mean(predict(xgb_fit, Xtmp))
+})
+pdp_df <- tibble(age = age_grid, proj_ops = pdp_age)
+
+ggplot(pdp_df, aes(age, proj_ops)) +
+  geom_line(colour = col_model, linewidth = 1.1) +
+  geom_point(colour = col_model, size = 1.6) +
+  geom_vline(xintercept = pdp_df$age[which.max(pdp_df$proj_ops)],
+             linetype = "dashed", colour = col_accent) +
+  annotate("text", x = pdp_df$age[which.max(pdp_df$proj_ops)] + 0.3,
+           y = min(pdp_df$proj_ops),
+           label = sprintf("modeled peak ~ age %d", pdp_df$age[which.max(pdp_df$proj_ops)]),
+           hjust = 0, colour = col_accent, size = 3.5) +
+  labs(title = "The aging curve the model learned",
+       subtitle = "Partial dependence of projected OPS on age",
+       x = "Age", y = "Projected OPS")
+```
+
+### SHAP: how each feature moves a projection
+
+```{r shap, fig.height=5}
+feat_names <- colnames(X_te_raw)
+shap_mat <- predict(xgb_fit, X_te_raw, predcontrib = TRUE)
+colnames(shap_mat) <- c(feat_names, "BIAS")
+shap_df <- as.data.frame(shap_mat[, feat_names, drop = FALSE])
+
+shap_imp <- tibble(feature = feat_names, mean_abs = colMeans(abs(shap_df))) |>
+  arrange(desc(mean_abs))
+top_feats <- head(shap_imp$feature, 10)
+
+shap_long <- bind_rows(lapply(top_feats, function(f)
+  tibble(feature = f, shap = shap_df[[f]], value = X_te_raw[, f]))) |>
+  group_by(feature) |>
+  mutate(value_scaled = (value - min(value)) / (max(value) - min(value) + 1e-9)) |>
+  ungroup() |>
+  mutate(feature = factor(feature, levels = rev(top_feats)))
+
+ggplot(shap_long, aes(x = shap, y = feature, colour = value_scaled)) +
+  geom_vline(xintercept = 0, colour = "grey70") +
+  geom_jitter(height = 0.22, alpha = 0.35, size = 0.8) +
+  scale_colour_gradient(low = "#2C7FB8", high = "#800000",
+                        name = "feature value", breaks = c(0, 1),
+                        labels = c("low", "high")) +
+  labs(title = "SHAP summary",
+       subtitle = "Each dot is a test player; x = contribution to projected OPS",
+       x = "SHAP value (OPS units)", y = NULL)
+```
+
+A single-player view turns the model from a score into an explanation:
+
+```{r shap-one, fig.height=5}
+schwarber_rows <- which(test_df$nameFirst == "Kyle" & test_df$nameLast == "Schwarber")
+ex_i <- schwarber_rows[which.max(test_df$ops_target[schwarber_rows])]
+ex_name <- paste(test_df$nameFirst[ex_i], test_df$nameLast[ex_i], test_df$yearID[ex_i])
+ex_contrib <- tibble(feature = feat_names,
+                     contribution = as.numeric(shap_mat[ex_i, feat_names])) |>
+  arrange(desc(abs(contribution))) |> head(10)
+
+ggplot(ex_contrib, aes(x = contribution, y = reorder(feature, contribution),
+                       fill = contribution > 0)) +
+  geom_col(width = 0.7) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  scale_fill_manual(values = c(`TRUE` = col_model, `FALSE` = col_accent), guide = "none") +
+  labs(title = paste0(ex_name),
+       subtitle = sprintf("Predicted %.3f vs actual %.3f (baseline %.3f)",
+                          pred_xgb[ex_i], test_df$ops_target[ex_i], shap_mat[ex_i, "BIAS"]),
+       x = "Contribution to projected OPS", y = NULL)
+```
+
+## Diagnostics
+
+```{r pva, fig.height=7}
+pva <- bind_rows(
+  tibble(model = "Linear regression", actual = y_te, pred = pred_lm),
+  tibble(model = "Elastic net",       actual = y_te, pred = pred_gn),
+  tibble(model = "XGBoost",           actual = y_te, pred = pred_xgb),
+  tibble(model = "Baseline: Marcel",  actual = y_te, pred = pred_marcel)
+)
+rmse_lab <- pva |> group_by(model) |>
+  summarise(RMSE = sqrt(mean((actual - pred)^2)), .groups = "drop") |>
+  mutate(lab = sprintf("RMSE = %.4f", RMSE))
+
+ggplot(pva, aes(actual, pred)) +
+  geom_abline(slope = 1, intercept = 0, colour = col_accent, linetype = "dashed") +
+  geom_point(alpha = 0.15, size = 0.7, colour = col_model) +
+  geom_text(data = rmse_lab, aes(x = 0.45, y = 1.15, label = lab),
+            hjust = 0, size = 3.3, inherit.aes = FALSE) +
+  facet_wrap(~ model) +
+  coord_equal(xlim = c(0.4, 1.2), ylim = c(0.4, 1.2)) +
+  labs(title = "Predicted vs. actual next-season OPS (test set)",
+       subtitle = "Dashed line = perfect prediction", x = "Actual OPS", y = "Projected OPS")
+```
+
+Residuals shrink as plate appearances rise — projections are inherently noisier
+for players who got less playing time, the small-sample reliability point:
+
+```{r resid, fig.height=4.8}
+tibble(pa_target = test_df$pa_target, resid = y_te - pred_xgb) |>
+  ggplot(aes(pa_target, resid)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_point(alpha = 0.2, size = 0.8, colour = col_model) +
+  geom_smooth(method = "loess", se = TRUE, colour = col_accent, linewidth = 1) +
+  labs(title = "Residuals vs. playing time (XGBoost)",
+       subtitle = "Spread narrows as plate appearances rise",
+       x = "Plate appearances (projected season)", y = "Actual - Projected OPS")
+```
+
+# =============================================================================
+# MLB OPS projection -- STATCAST EXTENSION
+# Does adding prior-season "expected" stats (xwOBA / xBA / xSLG) improve a
+# next-season OPS projection over the traditional-stats model?
+# =============================================================================
+#
+# STAGE 1 of this step is DATA: pull Baseball Savant leaderboards, crosswalk
+# Savant's MLBAM ids to Lahman's playerID via the Chadwick register, and join
+# lagged Statcast features onto the model table. STAGE 2 is the model
+# comparison (same rows, with vs. without Statcast).
+#
+# *** This script reaches LIVE external sources (Baseball Savant + Chadwick). ***
+#   - Requires an internet connection.
+#   - First run downloads the Chadwick register (~1-2 min); cached afterwards.
+#   - VERIFY: open one Savant URL (printed below) in a browser to confirm the
+#     CSV columns. The columns that must exist are est_woba / est_ba / est_slg.
+# =============================================================================
+```{r}
+# ---- 0. Setup ---------------------------------------------------------------
+pkgs <- c("Lahman", "dplyr", "tidyr", "tibble", "purrr", "readr", "httr",
+          "ggplot2", "glmnet", "xgboost", "baseballr", "scales")
+new <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(new)) install.packages(new)
+invisible(lapply(pkgs, library, character.only = TRUE))
+ 
+set.seed(42)
+dir.create("figures", showWarnings = FALSE)
+dir.create("cache",   showWarnings = FALSE)
+ 
+DATA_START    <- 2012   # read a few years before the first Statcast target
+TARGET_START  <- 2016   # Statcast-era targets (need prior-yr Statcast = 2015+)
+STATCAST_START <- 2015  # Statcast data begins
+TRAIN_END_SC  <- 2022   # train on targets <= this; test on later years
+MIN_PA_TARGET <- 250
+MIN_PA_LAG1   <- 100
+ 
+col_a <- "#2C7FB8"; col_b <- "#800000"; col_grey <- "#BDBDBD"
+theme_set(theme_minimal(base_size = 12) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(face = "bold")))
+ 
+# Small cache + robust CSV fetch (browser-like UA; Savant blocks some clients)
+cache_get <- function(key, expr) {
+  f <- file.path("cache", paste0(key, ".rds"))
+  if (file.exists(f)) return(readRDS(f))
+  val <- force(expr); saveRDS(val, f); val
+}
+get_savant_csv <- function(url) {
+  resp <- httr::GET(url, httr::user_agent("Mozilla/5.0"))
+  httr::stop_for_status(resp)
+  readr::read_csv(httr::content(resp, as = "text", encoding = "UTF-8"),
+                  show_col_types = FALSE)
+}
+```
+```{r}
+# ---- 1. Lahman backbone (condensed; same logic as the main script) ----------
+bat_ps <- Batting |>
+  filter(yearID >= DATA_START, yearID != 2020) |>
+  group_by(playerID, yearID) |>
+  summarise(across(c(AB, H, X2B, X3B, HR, BB, SO, HBP, SH, SF),
+                   ~ sum(.x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(
+    PA = AB + BB + HBP + SF, TB = H + X2B + 2 * X3B + 3 * HR,
+    AVG = ifelse(AB > 0, H / AB, NA_real_),
+    OBP = ifelse((AB + BB + HBP + SF) > 0, (H + BB + HBP) / (AB + BB + HBP + SF), NA_real_),
+    SLG = ifelse(AB > 0, TB / AB, NA_real_), OPS = OBP + SLG,
+    BBpct = ifelse(PA > 0, BB / PA, NA_real_), Kpct = ifelse(PA > 0, SO / PA, NA_real_),
+    BABIP = ifelse((AB - SO - HR + SF) > 0, (H - HR) / (AB - SO - HR + SF), NA_real_)
+  )
+ 
+league_year <- bat_ps |>
+  group_by(yearID) |>
+  summarise(H = sum(H), AB = sum(AB), BB = sum(BB), HBP = sum(HBP), SF = sum(SF),
+            X2B = sum(X2B), X3B = sum(X3B), HR = sum(HR), .groups = "drop") |>
+  mutate(lg_ops = (H + BB + HBP) / (AB + BB + HBP + SF) +
+                  (H + X2B + 2 * X3B + 3 * HR) / AB) |>
+  select(yearID, lg_ops)
+lg_ops_overall <- mean(league_year$lg_ops)
+ 
+people_df <- tryCatch(get("People"), error = function(e) get("Master"))
+bio <- people_df |>
+  transmute(playerID, bbrefID, birthYear, birthMonth,
+            height = as.numeric(height), weight = as.numeric(weight),
+            bats, nameFirst, nameLast)
+debut_year <- Batting |> group_by(playerID) |>
+  summarise(first_year = min(yearID), .groups = "drop")
+ 
+park_year <- Batting |>
+  filter(yearID >= DATA_START, yearID != 2020) |>
+  group_by(playerID, yearID, teamID) |> summarise(AB = sum(AB), .groups = "drop") |>
+  group_by(playerID, yearID) |> slice_max(AB, n = 1, with_ties = FALSE) |> ungroup() |>
+  left_join(select(Teams, yearID, teamID, BPF), by = c("yearID", "teamID")) |>
+  transmute(playerID, yearID, park_bpf = as.numeric(BPF))
+ 
+pos_year <- Appearances |>
+  filter(yearID >= DATA_START, yearID != 2020) |>
+  group_by(playerID, yearID) |>
+  summarise(across(c(G_c, G_1b, G_2b, G_3b, G_ss, G_lf, G_cf, G_rf, G_dh),
+                   ~ sum(.x, na.rm = TRUE)), .groups = "drop") |>
+  mutate(OF = G_lf + G_cf + G_rf) |>
+  transmute(playerID, yearID, C = G_c, `1B` = G_1b, `2B` = G_2b, `3B` = G_3b,
+            SS = G_ss, OF = OF, DH = G_dh) |>
+  pivot_longer(-c(playerID, yearID), names_to = "primary_pos", values_to = "G") |>
+  filter(G > 0) |> group_by(playerID, yearID) |>
+  slice_max(G, n = 1, with_ties = FALSE) |> ungroup() |>
+  select(playerID, yearID, primary_pos)
+ 
+lag1 <- bat_ps |> transmute(playerID, yearID = yearID + 1,
+  lag1_OBP = OBP, lag1_SLG = SLG, lag1_AVG = AVG, lag1_OPS = OPS,
+  lag1_BBpct = BBpct, lag1_Kpct = Kpct, lag1_BABIP = BABIP, lag1_PA = PA)
+lag2 <- bat_ps |> transmute(playerID, yearID = yearID + 2, lag2_OPS = OPS, lag2_PA = PA)
+lag3 <- bat_ps |> transmute(playerID, yearID = yearID + 3, lag3_OPS = OPS, lag3_PA = PA)
+target <- bat_ps |> transmute(playerID, yearID, ops_target = OPS, pa_target = PA)
+ 
+model_df <- target |>
+  left_join(lag1, by = c("playerID", "yearID")) |>
+  left_join(lag2, by = c("playerID", "yearID")) |>
+  left_join(lag3, by = c("playerID", "yearID")) |>
+  left_join(bio, by = "playerID") |>
+  left_join(debut_year, by = "playerID") |>
+  left_join(mutate(pos_year,  yearID = yearID + 1), by = c("playerID", "yearID")) |>
+  left_join(mutate(park_year, yearID = yearID + 1), by = c("playerID", "yearID")) |>
+  left_join(transmute(league_year, yearID = yearID + 1, lag1_lg_ops = lg_ops), by = "yearID") |>
+  mutate(age = yearID - birthYear - ifelse(!is.na(birthMonth) & birthMonth > 6, 1, 0),
+         experience = yearID - first_year, age_sq = age^2)
+ 
+w1 <- 5; w2 <- 4; w3 <- 3; REG <- 300
+model_df <- model_df |>
+  mutate(o1 = coalesce(lag1_OPS, 0), p1 = coalesce(lag1_PA, 0),
+         o2 = coalesce(lag2_OPS, 0), p2 = coalesce(lag2_PA, 0),
+         o3 = coalesce(lag3_OPS, 0), p3 = coalesce(lag3_PA, 0),
+         num = w1*p1*o1 + w2*p2*o2 + w3*p3*o3, den = w1*p1 + w2*p2 + w3*p3,
+         lgb = coalesce(lag1_lg_ops, lg_ops_overall),
+         age_factor = ifelse(age < 29, 1 + (29-age)*0.006, 1 + (29-age)*0.003),
+         marcel_ops = ((num + lgb*REG)/(den + REG)) * age_factor) |>
+  select(-o1,-o2,-o3,-p1,-p2,-p3,-num,-den,-lgb,-age_factor)
+ 
+base_num <- c("lag1_OBP","lag1_SLG","lag1_AVG","lag1_BBpct","lag1_Kpct",
+              "lag1_BABIP","lag1_PA","marcel_ops","age","age_sq",
+              "experience","height","weight","park_bpf")
+base_fac <- c("bats","primary_pos")
+ 
+model_df <- model_df |>
+  filter(yearID >= TARGET_START,
+         !is.na(lag1_OBP), lag1_PA >= MIN_PA_LAG1, pa_target >= MIN_PA_TARGET,
+         !is.na(primary_pos), !is.na(park_bpf), bats %in% c("L","R","B"),
+         !is.na(height), !is.na(weight), !is.na(age), !is.na(experience)) |>
+  filter(if_all(all_of(base_num), ~ !is.na(.)))
+ 
+```
+```{r}
+# ---- 2. Crosswalk: Lahman playerID  <->  Savant MLBAM id --------------------
+# Chadwick register links every id system. Join Lahman bbrefID -> key_bbref.
+chad <- cache_get("chadwick", baseballr::chadwick_player_lu())
+pid2mlbam <- bio |>
+  filter(!is.na(bbrefID), bbrefID != "") |>
+  distinct(playerID, bbrefID) |>
+  inner_join(
+    chad |> filter(!is.na(key_mlbam), !is.na(key_bbref), key_bbref != "") |>
+      transmute(bbrefID = key_bbref, key_mlbam = as.integer(key_mlbam)),
+    by = "bbrefID"
+  ) |>
+  distinct(playerID, key_mlbam)
+```
+```{r}
+# ---- 3. Pull Statcast leaderboards per year ---------------------------------
+fetch_statcast_year <- function(y) cache_get(sprintf("statcast_%d", y), {
+  # Expected statistics (the stable, essential leaderboard)
+  exp_url <- sprintf(paste0("https://baseballsavant.mlb.com/leaderboard/",
+                            "expected_statistics?type=batter&year=%d&position=",
+                            "&team=&min=50&csv=true"), y)
+  ex <- get_savant_csv(exp_url)
+  out <- tibble(key_mlbam = as.integer(ex$player_id), yearID = y,
+                sc_xwoba = ex$est_woba, sc_xba = ex$est_ba,
+                sc_xslg = ex$est_slg, sc_woba = ex$woba)
+ 
+  # Exit velocity & barrels (best-effort; column names vary by Savant version)
+  brl <- tryCatch({
+    b_url <- sprintf(paste0("https://baseballsavant.mlb.com/leaderboard/",
+                            "statcast?type=batter&year=%d&position=&team=",
+                            "&min=50&csv=true"), y)
+    get_savant_csv(b_url)
+  }, error = function(e) NULL)
+  if (!is.null(brl) && "player_id" %in% names(brl)) {
+    pick <- function(cands) {
+      nm <- intersect(cands, names(brl)); if (length(nm)) brl[[nm[1]]] else NA_real_
+    }
+    bdf <- tibble(
+      key_mlbam  = as.integer(brl$player_id),
+      sc_barrel  = pick(c("brl_pa","barrels_per_pa_percent","barrel_batted_rate","brl_percent")),
+      sc_hardhit = pick(c("ev95percent","hard_hit_percent")),
+      sc_ev      = pick(c("avg_hit_speed","exit_velocity_avg")),
+      sc_la      = pick(c("avg_hit_angle","launch_angle_avg"))
+    )
+    out <- left_join(out, bdf, by = "key_mlbam")
+  }
+  out
+})
+ 
+fetch_years <- STATCAST_START:max(model_df$yearID)
+cat("Example Savant URL to verify in a browser:\n  ",
+    sprintf(paste0("https://baseballsavant.mlb.com/leaderboard/expected_",
+                   "statistics?type=batter&year=%d&min=50&csv=true"),
+            STATCAST_START), "\n")
+statcast_all <- purrr::map_dfr(fetch_years, fetch_statcast_year)
+```
+```{r}
+# ---- 4. Attach LAGGED Statcast features to the model table ------------------
+sc_player <- statcast_all |>
+  inner_join(pid2mlbam, by = "key_mlbam") |>
+  select(playerID, yearID, dplyr::starts_with("sc_"))
+ 
+sc_lag1 <- sc_player |>
+  mutate(yearID = yearID + 1) |>
+  rename_with(~ paste0("lag1_", .x), dplyr::starts_with("sc_"))
+ 
+model_sc <- model_df |> left_join(sc_lag1, by = c("playerID", "yearID"))
+ 
+# Expected-stats features are the formal comparison set (reliably present).
+sc_core <- c("lag1_sc_xwoba", "lag1_sc_xba", "lag1_sc_xslg", "lag1_sc_woba")
+# Keep only rows matched to Statcast so base vs +Statcast is apples-to-apples.
+model_sc <- model_sc |>
+  filter(if_all(all_of(sc_core), ~ !is.na(.))) |>
+  mutate(bats = factor(bats), primary_pos = factor(primary_pos))
+ 
+# ---- JOIN COVERAGE: the health check ----------------------------------------
+cat(sprintf("\nLahman player-seasons (2016+, qualified): %d\n", nrow(model_df)))
+cat(sprintf("Matched to Statcast (used in comparison):  %d  (%.0f%%)\n",
+            nrow(model_sc), 100 * nrow(model_sc) / nrow(model_df)))
+cat(sprintf("Target years available: %s\n",
+            paste(sort(unique(model_sc$yearID)), collapse = ", ")))
+cat("\nStatcast feature coverage (non-missing):\n")
+print(colMeans(!is.na(select(model_sc, dplyr::starts_with("lag1_sc_")))))
+```
+```{r}
+# ---- 5. Hypothesis peek: which T-1 metric best tracks next-year OPS? --------
+cor_with_target <- function(x) cor(x, model_sc$ops_target, use = "complete.obs")
+cor_df <- tibble(
+  metric = c("lag1 OPS (actual)", "lag1 SLG (actual)",
+             "lag1 xwOBA", "lag1 xSLG", "lag1 wOBA (actual)"),
+  r = c(cor_with_target(model_sc$lag1_OPS), cor_with_target(model_sc$lag1_SLG),
+        cor_with_target(model_sc$lag1_sc_xwoba), cor_with_target(model_sc$lag1_sc_xslg),
+        cor_with_target(model_sc$lag1_sc_woba))
+)
+p_cor <- ggplot(cor_df, aes(x = r, y = reorder(metric, r))) +
+  geom_col(fill = col_a, width = 0.7) +
+  geom_text(aes(label = sprintf("%.3f", r)), hjust = -0.1, size = 3.5) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Which prior-season metric best predicts next-season OPS?",
+       subtitle = "Correlation with target OPS (Statcast era). Higher = better leading indicator.",
+       x = "Correlation with next-season OPS", y = NULL)
+ggsave("figures/10_statcast_predictor_correlations.png", p_cor,
+       width = 8, height = 4, dpi = 150)
+print(p_cor)
+```
+```{r}
+# ---- 6. Model comparison: base vs. base + Statcast (same rows) --------------
+metrics <- function(actual, pred) {
+  e <- actual - pred
+  tibble(RMSE = sqrt(mean(e^2)), MAE = mean(abs(e)),
+         R2 = 1 - sum(e^2) / sum((actual - mean(actual))^2))
+}
+xgb_params <- list(objective = "reg:squarederror", eta = 0.05, max_depth = 3,
+                   subsample = 0.8, colsample_bytree = 0.8, min_child_weight = 5)
+ 
+build_mats <- function(df, numf, facf, train_end) {
+  form <- as.formula(paste("~", paste(c(numf, facf), collapse = " + ")))
+  X <- model.matrix(form, df)[, -1, drop = FALSE]; y <- df$ops_target
+  tr <- which(df$yearID <= train_end); te <- which(df$yearID > train_end)
+  sc <- which(colnames(X) %in% numf)
+  mu <- colMeans(X[tr, sc, drop = FALSE]); s <- apply(X[tr, sc, drop = FALSE], 2, sd); s[s == 0] <- 1
+  Xs <- X; Xs[, sc] <- scale(X[, sc], center = mu, scale = s)
+  list(Xtr = X[tr, , drop = FALSE], Xte = X[te, , drop = FALSE],
+       Xtr_s = Xs[tr, , drop = FALSE], Xte_s = Xs[te, , drop = FALSE],
+       ytr = y[tr], yte = y[te])
+}
+run_models <- function(M, label) {
+  cvg <- cv.glmnet(M$Xtr_s, M$ytr, alpha = 0.5, nfolds = 10)
+  pg  <- as.numeric(predict(cvg, newx = M$Xte_s, s = "lambda.min"))
+  dtr <- xgb.DMatrix(M$Xtr, label = M$ytr)
+  cvx <- xgb.cv(xgb_params, dtr, nrounds = 1500, nfold = 5,
+                early_stopping_rounds = 40, verbose = 0)
+  nb  <- ifelse(!is.null(cvx$best_iteration), cvx$best_iteration,
+                which.min(cvx$evaluation_log$test_rmse_mean))
+  fx  <- xgb.train(xgb_params, dtr, nrounds = nb)
+  px  <- predict(fx, M$Xte)
+  list(table = bind_rows(
+        metrics(M$yte, pg) |> mutate(model = "Elastic net", features = label),
+        metrics(M$yte, px) |> mutate(model = "XGBoost",     features = label)),
+       xgb = fx)
+}
+ 
+M_base <- build_mats(model_sc, base_num, base_fac, TRAIN_END_SC)
+M_full <- build_mats(model_sc, c(base_num, sc_core), base_fac, TRAIN_END_SC)
+res_base <- run_models(M_base, "Traditional only")
+res_full <- run_models(M_full, "+ Statcast (xStats)")
+ 
+comparison <- bind_rows(res_base$table, res_full$table) |>
+  select(model, features, RMSE, MAE, R2) |>
+  arrange(model, features)
+cat("\nModel comparison (test years > ", TRAIN_END_SC, "):\n", sep = "")
+print(comparison)
+ 
+p_comp <- ggplot(comparison, aes(x = model, y = RMSE, fill = features)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.65) +
+  geom_text(aes(label = sprintf("%.4f", RMSE)),
+            position = position_dodge(width = 0.7), vjust = -0.4, size = 3.2) +
+  scale_fill_manual(values = c("Traditional only" = col_grey,
+                               "+ Statcast (xStats)" = col_a), name = NULL) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(title = "Do expected stats improve next-season OPS projections?",
+       subtitle = "Same players, same test seasons; lower RMSE is better",
+       x = NULL, y = "RMSE")
+ggsave("figures/11_statcast_model_comparison.png", p_comp,
+       width = 8, height = 4.5, dpi = 150)
+print(p_comp)
+ 
+# Where do the Statcast features rank when included?
+imp <- xgb.importance(model = res_full$xgb, feature_names = colnames(M_full$Xtr))
+p_imp <- ggplot(head(imp, 15), aes(x = Gain, y = reorder(Feature, Gain),
+                                   fill = grepl("sc_", Feature))) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = c(`FALSE` = col_grey, `TRUE` = col_b), guide = "none") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(title = "Feature importance with Statcast included",
+       subtitle = "Orange = Statcast (expected-stat) features",
+       x = "Gain", y = NULL)
+ggsave("figures/12_statcast_importance.png", p_imp, width = 8, height = 5, dpi = 150)
+print(p_imp)
+ 
+cat("\nDone. New figures: figures/10_*, 11_*, 12_*\n")
+```
