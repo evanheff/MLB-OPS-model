@@ -15,16 +15,8 @@ The ceiling is low because the problem is hard. The model regresses extremes tow
 
 **What's in this repo**
 
-.
-├── README.md
-├── mlb_ops_story.Rmd        # primary analysis: an interpretable regression, built one layer at a time
-├── mlb_ops_story.pdf        # rendered report (the version shared on LinkedIn)
-├── extended/
-│   ├── mlb_ops_projection.R # full-history pipeline: linear, elastic net, gradient-boosted trees, SHAP
-│   └── mlb_ops_statcast.R   # Statcast-era comparison: how much do expected stats add?
-└── figures/                 # generated plots
-The primary analysis (mlb_ops_story.Rmd) is the polished narrative: it builds an ordinary least squares model up one layer at a time and knits to a self-contained HTML report.
-The two scripts under extended/ are the broader modeling exploration. They predate the final regression and run on the full Lahman history rather than the Statcast era, so their numbers differ from the headline report. They are kept to show the wider toolbox: regularization, tree-based models, model comparison, and SHAP interpretability.
+The primary analysis is the polished narrative: it builds an ordinary least squares model up one layer at a time and knits to a self-contained HTML report.
+The full history pipeline is the broader modeling exploration. They predate the final regression and run on the full Lahman history rather than the Statcast era, so their numbers differ from the headline report. They are kept to show the wider toolbox: regularization, tree-based models, model comparison, and SHAP interpretability.
 
 **Reproducing it**
 
